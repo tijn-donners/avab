@@ -18,6 +18,6 @@
       ]
     }
   },
-   "runArgs": ["--env-file", "${localWorkspaceFolder}/.env"]
+   "runArgs": ["--env-file", "${localWorkspaceFolder}/.env", "--add-host=host.docker.internal:host-gateway"]
 }
 
