@@ -51,6 +51,14 @@ Gemeente = Literal[tuple(GEMEENTEN)]
 Plaats = Literal[tuple(PLAATSEN)]    
 
 
+class TranscriptSegment(BaseModel):
+    """Een tijdgebonden segment van een automatische transcriptie (Whisper)."""
+
+    Starttijd: str  # HH:MM:SS.mmm
+    Eindtijd: str   # HH:MM:SS.mmm
+    Tekst: str
+
+
 class FilmFragment(BaseModel):
     model_config = ConfigDict(populate_by_name=True)
 
@@ -73,6 +81,12 @@ class FilmFragment(BaseModel):
     Vrij_downloaden: JaNee = Field(alias="Vrij downloaden")
     Uitsl_van_uitvoer: str = Field(default="", alias="Uitsl. van uitvoer")
     Automatische_Transcriptie : str
+    Automatische_Transcriptie_Segmenten : list[TranscriptSegment] = Field(
+        default=[],
+        # de transcriptiesegmenten worden code-side gezet vanuit de whisper-mapping,
+        # en worden niet door de LLM gegenereerd
+        json_schema_extra={"llm_hint": "generate an empty list; the pipeline fills this field itself"},
+    )
     Personen : str
     Trefwoorden : str
 

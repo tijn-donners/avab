@@ -1,4 +1,4 @@
-from output_schema import Records, FilmFragment, GEMEENTEN, PLAATSEN
+from output_schema import Records, FilmFragment, TranscriptSegment, GEMEENTEN, PLAATSEN
 from termennetwerk_zoekfunctie import zoek_in_termennetwerk
 
 from scenedetect import detect, AdaptiveDetector, save_images, open_video
@@ -29,11 +29,13 @@ def get_frames(video_path, scene_list):
     frames = save_images(
                     scene_list,
                     open_video(video_path), #takes video_path and turns it into a VideoStream object
-                    interval=1.0,     # 1 frame is saved per  seconds of video (ints are frames, floats are seconds!)
-                    min_images=1, # if the scene is shorter than 15 seconds
+                    interval=1.5,     # 1 frame is saved per  seconds of video (ints are frames, floats are seconds!)
+                    min_images=1, 
+                    max_images=5,  
                     frame_margin= 0.1, # waits 0.5 seconds for the first frame
                     output_dir=f"frames/{video_path.removeprefix("data/")}",
-                    image_extension="jpg",
+                    image_extension="jpg",  
+                    width=480,  # width pixels. Keep small to keep token input low for LLM inference. height pixels adjust according to aspect ratio of video
                     show_progress=True 
                     ) 
     
@@ -48,13 +50,12 @@ def transcribe_audio(video_path):
     """
     print("starting transcription of audio")
 
-    model = WhisperModel("large-v3-turbo", device="cpu", compute_type="int8", cpu_threads=8)
+    model = WhisperModel("large-v3", device="cpu", compute_type="int8", cpu_threads=8)
     segments, info = model.transcribe(
         video_path,
         language="nl",
         vad_filter=True,
         word_timestamps=True,
-        beam_size=1,
     )
 
     segments = list(segments)
@@ -150,22 +151,34 @@ def generate_archival_description(video_filename, scene_number, scene_start, sce
     raw = "".join(response)
     return Records.model_validate_json(raw)
       
+def _hhmmss(seconds: float) -> str:
+    """'11.52' -> '00:00:11.520' (HH:MM:SS.mmm, zoals in de scene-Starttijden)."""
+    ms = int(round(seconds * 1000))
+    h, ms = divmod(ms, 3_600_000)
+    m, ms = divmod(ms, 60_000)
+    s, ms = divmod(ms, 1000)
+    return f"{h:02d}:{m:02d}:{s:02d}.{ms:03d}"
+
+
 def map_transcription_to_scene(scene_list, segments, scene_number):
     """
-    Map the words with timestamps from segments to the scenes in the scenelist
+    Map de segments met timestamps van whisper naar de scenes in de scenelijst.
+    Returns:
+        list of dicts {"start", "end", "text"}: de (tijdgebonden) segmenten die
+        de scene overlappen, in volgorde van tijd. Lijst leeg als er geen spraak
+        in de scene zit (de transcriptie wordt NIET aangevuld uit de volledige
+        transcriptie: die wordt code-side vastgesteld).
     """
     scene_start = scene_list[scene_number - 1][0].seconds
     scene_end = scene_list[scene_number - 1][1].seconds
-    
-    
-    scene_transcription = []
-    for segment in segments:
-        for word in segment.words:
-            if word.start >= scene_start and word.end < scene_end:
-                scene_transcription.append(word.word)
 
-    print("".join(scene_transcription).strip())
-    return "".join(scene_transcription).strip()
+    scene_segments = [
+        {"start": seg.start, "end": seg.end, "text": seg.text.strip()}
+        for seg in segments
+        if seg.start < scene_end and seg.end > scene_start
+    ]
+    print(" ".join(s["text"] for s in scene_segments).strip())
+    return scene_segments
 
 def extract_toegang_inventarisnummer(bestandnaam):
     """
@@ -240,28 +253,50 @@ def pipeline(video_path, transcribe: bool, local_inference: bool):
     if transcribe == True:
         # transcribe audio
         segments, full_transcription = transcribe_audio(video_path)
-    
-    
-        # create a dir to persist prompt responses
-        os.makedirs("output/" + video_path.removeprefix('data/').removesuffix('.mp4'), exist_ok=True)
+
+        # persisteer de tijdgebonden transcriptie (whisper-segmenten) en de .srt
+        stem = video_path.removeprefix('data/').removesuffix('.mp4')
+        out_dir = Path("output") / stem
+        os.makedirs(out_dir, exist_ok=True)
+        transcript = [{"start": s.start, "end": s.end, "text": s.text.strip()}
+                      for s in segments]
+        with open(out_dir / "transcript.json", "w", encoding="utf-8") as f:
+            json.dump(transcript, f, ensure_ascii=False, indent=2)
+        with open(out_dir / f"{stem}.srt", "w", encoding="utf-8") as f:
+            f.write(segments_to_srt(segments))
+
         # per scene, prompt LLM via ollama with context (existing metadata, transcription and frames from scene)
         for i in range(len(scene_list)):
             print(scene_list[i])
+            scene_segments = map_transcription_to_scene(scene_list, segments, i + 1)
+            scene_transcriptie = " ".join(s["text"] for s in scene_segments).strip()
             response = generate_archival_description(
                     video_path.removeprefix("data/"),
                     i + 1,  # scene_number
                     scene_list[i][0], # start time of scene
                     scene_list[i][1], # end time of scene
-                    map_transcription_to_scene(scene_list, segments, i + 1), # string that contains the transcription for the scene only
-                    full_transcription, 
+                    scene_transcriptie, # string that contains the transcription for the scene only
+                    full_transcription,
                     retrieve_original_description(video_path.removeprefix("data/")), # string (XML) with existing metadata from MAIS-flexis, for pormpt context
                     extract_toegang_inventarisnummer(video_path.removeprefix("data/"))[0], # toegang extracted from filename
                     extract_toegang_inventarisnummer(video_path.removeprefix("data/"))[1], # inventarisnummer extracted from filename
                     local_inference
                     )
 
+            # de transcriptie wordt code-side vastgesteld op basis van de
+            # whisper-mapping; de LLM mag die niet zelf invullen (die
+            # hallucineerde anders bijv. tekst uit de volledige transcriptie
+            # in scenes zonder spraak)
+            if response.items:
+                frag = response.items[0]
+                frag.Automatische_Transcriptie = scene_transcriptie
+                frag.Automatische_Transcriptie_Segmenten = [
+                    TranscriptSegment(Starttijd=_hhmmss(s["start"]),
+                                      Eindtijd=_hhmmss(s["end"]),
+                                      Tekst=s["text"])
+                    for s in scene_segments
+                ]
 
-            
             with open(f"output/{video_path.removeprefix('data/').removesuffix('.mp4')}/scene_{i+1}.json", "w", encoding="utf-8") as f:
                 f.write(response.model_dump_json(indent=2))
 
@@ -270,8 +305,6 @@ def pipeline(video_path, transcribe: bool, local_inference: bool):
         
             # create a dir to persist prompt responses
             os.makedirs("output/" + video_path.removeprefix('data/').removesuffix('.mp4'), exist_ok=True)
-
-            int(local_inference)
 
             # per scene, prompt LLM via ollama with context (existing metadata, transcription and frames from scene)
             for i in range(len(scene_list)):
@@ -309,4 +342,4 @@ def termen_linking(keyword, termen, json_scene_path):
 
 
 if __name__ == "__main__":
-    pipeline("data/NL-BklVV_0752_0001.mp4", transcribe=False, local_inference=True)
+    pipeline("data/NL-BklVV_0752_0001.mp4", transcribe=True, local_inference=False)
